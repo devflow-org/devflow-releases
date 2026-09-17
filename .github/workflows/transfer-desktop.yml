@@ -18,10 +18,13 @@ on:
         required: true
 permissions:
   contents: write
+concurrency:
+  group: transfer-${{ inputs.release_tag }}
+  cancel-in-progress: false
 jobs:
   transfer:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Download and verify installer
         env:
@@ -60,5 +63,50 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           ASSET_NAME: ${{ inputs.filename }}
         run: |
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          gh release upload "$RELEASE_TAG" "output/$ASSET_NAME" "output/$ASSET_NAME.sha256"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, time, urllib.parse
+          repo, tag = os.environ['GH_REPO'], os.environ['RELEASE_TAG']
+          if repo != 'devflow-org/devflow-releases': raise SystemExit('Unexpected distribution repository')
+          def gh(*args):
+            return subprocess.check_output(['gh', *args], text=True, timeout=45)
+          def release():
+            rows = json.loads(gh('api', f'repos/{repo}/releases?per_page=100'))
+            result = next(r for r in rows if r['tag_name'] == tag)
+            if not result['draft']: raise SystemExit('Only draft releases may receive assets')
+            return result
+          # Explicit limits and progress make a stalled large upload observable.
+          # After an ambiguous failure, inspect the server before any retry.
+          for name in (os.environ['ASSET_NAME'], os.environ['ASSET_NAME'] + '.sha256'):
+            file = pathlib.Path('output') / name
+            expected = 'sha256:' + hashlib.file_digest(file.open('rb'), 'sha256').hexdigest()
+            size = file.stat().st_size
+            def verified(asset):
+              if asset['state'] != 'uploaded': return False
+              if asset.get('digest') != expected or asset['size'] != size:
+                raise SystemExit('Existing asset differs from verified file: ' + name)
+              return True
+            for attempt in range(3):
+              current = release()
+              asset = next((a for a in current['assets'] if a['name'] == name), None)
+              if asset and verified(asset): break
+              if asset:
+                gh('api', '--method', 'DELETE', f"repos/{repo}/releases/assets/{asset['id']}")
+              url = f"https://uploads.github.com/repos/{repo}/releases/{current['id']}/assets?" + urllib.parse.urlencode({'name': name})
+              print(f'Uploading {name}, {size} bytes, attempt {attempt + 1}', flush=True)
+              result = subprocess.run([
+                'curl', '--http1.1', '--fail-with-body', '--show-error',
+                '--connect-timeout', '30', '--max-time', '480',
+                '--speed-limit', '65536', '--speed-time', '60',
+                '-H', 'Authorization: Bearer ' + os.environ['GH_TOKEN'],
+                '-H', 'Content-Type: application/octet-stream',
+                '--data-binary', '@' + str(file), '--output', 'upload-response.json', url,
+              ], timeout=500)
+              current = release()
+              asset = next((a for a in current['assets'] if a['name'] == name), None)
+              if asset and verified(asset): break
+              print(f'Upload not confirmed (curl exit {result.returncode}); checking again before retry', flush=True)
+              time.sleep(5)
+            else:
+              raise SystemExit('Upload failed; release remains a draft')
+            print('Verified uploaded checksum and size: ' + name, flush=True)
+          PY
